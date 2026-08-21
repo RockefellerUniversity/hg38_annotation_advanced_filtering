@@ -9,7 +9,7 @@ output:
     df_print: paged
     code_folding: hide
 params:
-  old_table: "gene_confidence_table.csv"                       # output of GeneSet_Filtering.Rmd (BRC current set)
+  old_table: "output/gene_confidence_table.csv"                # output of GeneSet_Filtering.Rmd (BRC current set)
   # GENCODE v50 (GRCh38.p14) comprehensive, primary assembly. Downloaded 2026-08-20 from:
   #   https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.primary_assembly.annotation.gtf.gz
   gencode_gtf: "gencode.v50.primary_assembly.annotation.gtf.gz"  # read directly from .gz

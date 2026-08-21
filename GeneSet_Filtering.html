@@ -3295,9 +3295,9 @@ tier.</p>
 <p>This is the table everything else reads from. One row per gene body,
 holding the coordinates, the biotype and symbol, the confidence
 components, the overlap and nesting flags, and the keep/tier decisions.
-We write it to <code>gene_confidence_table.csv</code> so the filtering
-can be applied to an existing count matrix without re-running any of
-this.</p>
+We write it to <code>output/gene_confidence_table.csv</code> so the
+filtering can be applied to an existing count matrix without re-running
+any of this.</p>
 <p>Every column:</p>
 <table>
 <colgroup>
@@ -3459,7 +3459,7 @@ another kept gene (the stricter, structural variant).</td>
          keep, keep_no_nested,
          keep_high_medium, keep_high_medium_no_nested,
          keep_high, keep_high_no_nested)
-write.csv(gene_tbl, &quot;gene_confidence_table.csv&quot;, row.names = FALSE)
+write.csv(gene_tbl, file.path(params$output_dir, &quot;gene_confidence_table.csv&quot;), row.names = FALSE)
 head(gene_tbl, 20)</code></pre>
 <div data-pagedtable="false">
 <script data-pagedtable-source type="application/json">
@@ -3468,7 +3468,7 @@ head(gene_tbl, 20)</code></pre>
 </div>
 <p>Finally, write out a plain gene-ID list (one ENSG per line) for each
 filter and its no-nested variant, for use as a gene set downstream.
-These are the <code>genes_*.txt</code> files.</p>
+These are the <code>output/genes_*.txt</code> files.</p>
 <pre class="r"><code>export_sets &lt;- list(
   keep                       = gene_tbl$keep,
   keep_no_nested             = gene_tbl$keep_no_nested,
@@ -3478,15 +3478,17 @@ These are the <code>genes_*.txt</code> files.</p>
   keep_high_no_nested        = gene_tbl$keep_high_no_nested
 )
 for (nm in names(export_sets))
-  writeLines(gene_tbl$gene_id[export_sets[[nm]]], paste0(&quot;genes_&quot;, nm, &quot;.txt&quot;))
-cat(sprintf(&quot;%-32s %d genes\n&quot;, paste0(&quot;genes_&quot;, names(export_sets), &quot;.txt&quot;),
+  writeLines(gene_tbl$gene_id[export_sets[[nm]]],
+             file.path(params$output_dir, paste0(&quot;genes_&quot;, nm, &quot;.txt&quot;)))
+cat(sprintf(&quot;%-40s %d genes\n&quot;,
+            file.path(params$output_dir, paste0(&quot;genes_&quot;, names(export_sets), &quot;.txt&quot;)),
             vapply(export_sets, sum, integer(1))), sep = &quot;&quot;)</code></pre>
-<pre><code>## genes_keep.txt                   32597 genes
-## genes_keep_no_nested.txt         26436 genes
-## genes_keep_high_medium.txt       32210 genes
-## genes_keep_high_medium_no_nested.txt 26107 genes
-## genes_keep_high.txt              24196 genes
-## genes_keep_high_no_nested.txt    21283 genes</code></pre>
+<pre><code>## output/genes_keep.txt                    32597 genes
+## output/genes_keep_no_nested.txt          26436 genes
+## output/genes_keep_high_medium.txt        32210 genes
+## output/genes_keep_high_medium_no_nested.txt 26107 genes
+## output/genes_keep_high.txt               24196 genes
+## output/genes_keep_high_no_nested.txt     21283 genes</code></pre>
 </div>
 <div id="summary-of-filters" class="section level1">
 <h1>8. Summary of filters</h1>

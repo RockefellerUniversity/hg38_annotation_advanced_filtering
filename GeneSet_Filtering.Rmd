@@ -19,6 +19,7 @@ params:
   keep_biotypes: !r c("protein_coding", "lncRNA", "lincRNA")
   keep_seqnames: !r paste0("chr", c(1:22, "X", "Y", "M"))   # set to character(0) to keep all
   cache_dir: "cache"
+  output_dir: "output"                 # generated outputs (confidence table + gene lists) go here
 ---
 
 ```{r setup, include=FALSE}
@@ -33,6 +34,7 @@ suppressMessages({
   library(knitr)
 })
 dir.create(params$cache_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(params$output_dir, showWarnings = FALSE, recursive = TRUE)
 T0 <- function(x) x %in% TRUE          # NA-safe "is TRUE" for tiering
 ```
 
@@ -382,8 +384,8 @@ gene_tbl <- gene_tbl %>% mutate(
 
 This is the table everything else reads from. One row per gene body, holding the coordinates, the
 biotype and symbol, the confidence components, the overlap and nesting flags, and the keep/tier
-decisions. We write it to `gene_confidence_table.csv` so the filtering can be applied to an existing
-count matrix without re-running any of this.
+decisions. We write it to `output/gene_confidence_table.csv` so the filtering can be applied to an
+existing count matrix without re-running any of this.
 
 Every column:
 
@@ -431,12 +433,12 @@ gene_tbl <- gene_tbl %>%
          keep, keep_no_nested,
          keep_high_medium, keep_high_medium_no_nested,
          keep_high, keep_high_no_nested)
-write.csv(gene_tbl, "gene_confidence_table.csv", row.names = FALSE)
+write.csv(gene_tbl, file.path(params$output_dir, "gene_confidence_table.csv"), row.names = FALSE)
 head(gene_tbl, 20)
 ```
 
 Finally, write out a plain gene-ID list (one ENSG per line) for each filter and its no-nested
-variant, for use as a gene set downstream. These are the `genes_*.txt` files.
+variant, for use as a gene set downstream. These are the `output/genes_*.txt` files.
 
 ```{r export-lists}
 export_sets <- list(
@@ -448,8 +450,10 @@ export_sets <- list(
   keep_high_no_nested        = gene_tbl$keep_high_no_nested
 )
 for (nm in names(export_sets))
-  writeLines(gene_tbl$gene_id[export_sets[[nm]]], paste0("genes_", nm, ".txt"))
-cat(sprintf("%-32s %d genes\n", paste0("genes_", names(export_sets), ".txt"),
+  writeLines(gene_tbl$gene_id[export_sets[[nm]]],
+             file.path(params$output_dir, paste0("genes_", nm, ".txt")))
+cat(sprintf("%-40s %d genes\n",
+            file.path(params$output_dir, paste0("genes_", names(export_sets), ".txt")),
             vapply(export_sets, sum, integer(1))), sep = "")
 ```
 
