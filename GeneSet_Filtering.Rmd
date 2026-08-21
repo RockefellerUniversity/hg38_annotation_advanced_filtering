@@ -369,9 +369,12 @@ gene_tbl <- gene_tbl %>% mutate(
     TRUE                                                                          ~ "low"
   ),
   confidence_tier = factor(confidence_tier, levels = c("high","medium","low","excluded")),
-  keep_high           = keep & confidence_tier == "high",
-  keep_high_no_nested = keep_high & !nested_in_keep,     # high, with the nesting filter applied
-  keep_high_medium    = keep & confidence_tier %in% c("high","medium")
+  keep_high        = keep & confidence_tier == "high",
+  keep_high_medium = keep & confidence_tier %in% c("high","medium"),
+  # no-nested variant of each filter (nesting measured against the KEEP set)
+  keep_no_nested             = keep & !nested_in_keep,
+  keep_high_medium_no_nested = keep_high_medium & !nested_in_keep,
+  keep_high_no_nested        = keep_high & !nested_in_keep
 )
 ```
 
@@ -408,11 +411,13 @@ Every column:
 | `has_gencode_basic` | TRUE if a transcript is in the GENCODE basic set. |
 | `overlaps_full` / `nested_in_full` | Overlaps / is nested inside another gene body — vs the full annotation. |
 | `overlaps_keep` / `nested_in_keep` | The same, but computed only among the confident (KEEP) genes — the decision-relevant figure. |
-| `keep` | TRUE if current and of a wanted biotype (the baseline confident set). |
 | `confidence_tier` | `high` / `medium` / `low` / `excluded` — the composite, evidence-only call (nesting not applied). |
+| `keep` | TRUE if current and of a wanted biotype (the baseline confident set). |
+| `keep_no_nested` | TRUE if `keep` and the gene is not nested inside another kept gene. |
+| `keep_high_medium` | TRUE if `keep` and tier is `high` or `medium`. |
+| `keep_high_medium_no_nested` | TRUE if `keep_high_medium` and not nested inside another kept gene. |
 | `keep_high` | TRUE if `keep` and tier is `high` (may include genes nested in another kept gene). |
 | `keep_high_no_nested` | TRUE if `keep_high` and the gene is not nested inside another kept gene (the stricter, structural variant). |
-| `keep_high_medium` | TRUE if `keep` and tier is `high` or `medium`. |
 
 ```{r final-table}
 gene_tbl <- gene_tbl %>%
@@ -422,9 +427,30 @@ gene_tbl <- gene_tbl %>%
          is_coding, complete_orf, multi_exon, n_tx, max_exons,
          has_ccds, min_tsl, has_appris_principal, has_gencode_basic,
          overlaps_full, nested_in_full, overlaps_keep, nested_in_keep,
-         keep, confidence_tier, keep_high, keep_high_no_nested, keep_high_medium)
+         confidence_tier,
+         keep, keep_no_nested,
+         keep_high_medium, keep_high_medium_no_nested,
+         keep_high, keep_high_no_nested)
 write.csv(gene_tbl, "gene_confidence_table.csv", row.names = FALSE)
 head(gene_tbl, 20)
+```
+
+Finally, write out a plain gene-ID list (one ENSG per line) for each filter and its no-nested
+variant, for use as a gene set downstream. These are the `genes_*.txt` files.
+
+```{r export-lists}
+export_sets <- list(
+  keep                       = gene_tbl$keep,
+  keep_no_nested             = gene_tbl$keep_no_nested,
+  keep_high_medium           = gene_tbl$keep_high_medium,
+  keep_high_medium_no_nested = gene_tbl$keep_high_medium_no_nested,
+  keep_high                  = gene_tbl$keep_high,
+  keep_high_no_nested        = gene_tbl$keep_high_no_nested
+)
+for (nm in names(export_sets))
+  writeLines(gene_tbl$gene_id[export_sets[[nm]]], paste0("genes_", nm, ".txt"))
+cat(sprintf("%-32s %d genes\n", paste0("genes_", names(export_sets), ".txt"),
+            vapply(export_sets, sum, integer(1))), sep = "")
 ```
 
 # 8. Summary of filters
