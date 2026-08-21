@@ -1,0 +1,626 @@
+---
+title: "Confident gene-set construction for nuclear RNA-seq counting"
+author: "BRC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+params:
+  # The BRC current annotation carries no biotype/symbol/version of its own, so we join
+  # those in — along with current-vs-retired status and the confidence attributes — from a
+  # pinned, current Ensembl release via biomaRt, which keeps the whole thing reproducible.
+  # Pin a CURRENT release for the retired call: pinning to the release the annotation was
+  # built from would just reproduce the input and flag nothing as retired.
+  gtf: "hg38.ensGene.gtf"
+  ensembl_version: 110                 # PINNED, CURRENT Ensembl release for biomaRt
+  keep_biotypes: !r c("protein_coding", "lncRNA", "lincRNA")
+  keep_seqnames: !r paste0("chr", c(1:22, "X", "Y", "M"))   # set to character(0) to keep all
+  cache_dir: "cache"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressMessages({
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(biomaRt)
+  library(org.Hs.eg.db)     # offline annotation fallback
+  library(dplyr)
+  library(tidyr)
+  library(knitr)
+})
+dir.create(params$cache_dir, showWarnings = FALSE, recursive = TRUE)
+T0 <- function(x) x %in% TRUE          # NA-safe "is TRUE" for tiering
+```
+
+# Purpose
+
+We count our nuclear libraries over whole gene bodies from the BRC current annotation. That GENCODE
+annotation came from the UCSC Table Browser and is just gene models: coordinates, but no biotype, no
+symbol, and nothing to say whether a gene is still current. This report adds that information in R
+and builds a per-gene confidence table we can filter on before differential expression. It is one
+knitted document, so it is also the record of how the gene set was made.
+
+We use two sources. The gene models come from the annotation itself (`rtracklayer::import`); from
+them we take the gene-body intervals we count over, plus a few signals that need nothing external
+(whether a gene has a complete ORF, how many exons and transcripts it has). Everything the annotation
+lacks — biotype, symbol, current-or-retired status, and the confidence attributes CCDS, TSL, APPRIS
+and GENCODE-basic — comes from a pinned Ensembl release through biomaRt. Pinning the release keeps
+the retired call reproducible.
+
+# 1. Import the GTF (once) and restrict to counted sequences
+
+```{r import}
+gtf_cache <- file.path(params$cache_dir, "gtf_import.rds")
+if (file.exists(gtf_cache)) {
+  gtf <- readRDS(gtf_cache)
+} else {
+  gtf <- rtracklayer::import(params$gtf)
+  saveRDS(gtf, gtf_cache)
+}
+if (length(params$keep_seqnames) > 0)
+  gtf <- gtf[as.character(seqnames(gtf)) %in% params$keep_seqnames]
+gtf$type <- as.character(gtf$type)
+cat(sprintf("Features: %d over %d sequences\n", length(gtf),
+            length(unique(as.character(seqnames(gtf))))))
+```
+
+# 2. Gene bodies + intrinsic confidence signals (from the GTF, in R)
+
+A gene body is the locus extent: the smallest start and largest end across the gene's features. That
+is the interval `genes(txdb)` gives `featureCounts`, so these flags describe what we actually count.
+From the same models we take a few signals that need nothing external:
+
+* `complete_orf` — the gene has a transcript with both a start and a stop codon, i.e. a complete CDS
+  model rather than a fragment.
+* `is_coding` — any CDS is annotated.
+* `multi_exon` — some transcript has more than one exon. Single-exon-only loci are enriched for
+  processed pseudogenes and retrogenes, and they matter here because a single-exon locus has no
+  introns for the nuclear reads to fall in.
+* `n_tx`, `max_exons` — isoform and exon structure, kept for context.
+
+```{r intrinsic}
+md <- as.data.frame(mcols(gtf))
+md$seqnames <- as.character(seqnames(gtf))
+md$start_ <- start(gtf); md$end_ <- end(gtf); md$strand_ <- as.character(strand(gtf))
+
+# gene-body extent over ALL features of the gene (robust to missing transcript rows)
+bodies <- md %>% filter(!is.na(gene_id)) %>%
+  group_by(gene_id) %>%
+  summarise(chr = dplyr::first(seqnames), strand = dplyr::first(strand_),
+            start = min(start_), end = max(end_), .groups = "drop") %>%
+  mutate(width = end - start + 1)
+
+# transcript-level structure -> gene rollup
+tx <- md %>% filter(!is.na(transcript_id)) %>%
+  group_by(gene_id, transcript_id) %>%
+  summarise(n_exon    = sum(type == "exon"),
+            has_start = any(type == "start_codon"),
+            has_stop  = any(type == "stop_codon"),
+            has_cds   = any(type == "CDS"),
+            .groups = "drop")
+intrinsic <- tx %>% group_by(gene_id) %>%
+  summarise(n_tx = dplyr::n_distinct(transcript_id),
+            max_exons = max(n_exon),
+            multi_exon = any(n_exon > 1),
+            complete_orf = any(has_start & has_stop),
+            is_coding = any(has_cds),
+            .groups = "drop")
+
+gene_tbl <- left_join(bodies, intrinsic, by = "gene_id")
+n0 <- nrow(gene_tbl)
+cat(sprintf("Gene bodies: %d\n", n0))
+```
+
+# 3. Pinned Ensembl annotation + confidence attributes (biomaRt)
+
+This step fills in everything the annotation lacks. We query biomaRt filtered to our gene IDs, in
+chunks with a few retries each, because one genome-wide pull usually has its connection reset
+partway through. Gene-level and transcript-level attributes go in separate queries, otherwise
+biomaRt throws its "attributes belong to different pages" error. The connection tries the pinned
+archive first (that is what makes a run reproducible) and falls back to a live mirror of the current
+release if the archive is down. If Ensembl cannot be reached at all we drop to a local NCBI
+annotation (`org.Hs.eg.db`) so the report still builds; the Ensembl-only attributes (CCDS, TSL,
+APPRIS, GENCODE-basic) are then missing and an Entrez cross-reference stands in for coding support.
+The source used is printed below, and the result is cached per release so re-knitting stays offline.
+
+The terms this section brings in, since they drive the tier later:
+
+| Term | What it means |
+|---|---|
+| **gene_biotype** | Ensembl's classification of a gene — `protein_coding`, `lncRNA`, various pseudogene classes, small-RNA classes, etc. We keep only the biotypes we care about. |
+| **retired** | The gene's Ensembl ID is no longer present in the pinned release, i.e. it has been withdrawn or merged since the annotation was built. Measured against Ensembl itself, not NCBI. |
+| **CCDS** (`has_ccds`) | The gene has a transcript in the Consensus CDS set — a coding region that Ensembl, NCBI and UCSC independently agree on. A strong "this is a real coding gene" mark. |
+| **TSL** (`min_tsl`) | Transcript Support Level, Ensembl's 1–5 rating of how well a transcript model is backed by mRNA/EST evidence (1 = best). We take the best level over a gene's transcripts. |
+| **APPRIS principal** (`has_appris_principal`) | The gene has an APPRIS-nominated principal isoform — the transcript APPRIS considers the main functional one, a sign of a well-characterised coding gene. |
+| **GENCODE basic** (`has_gencode_basic`) | The gene has a transcript in the GENCODE "basic" set — a representative, well-supported subset. Nearly every gene has one, so it is weak on its own. |
+| **HGNC-approved symbol** (`approved_symbol`) | The gene has a curated HGNC identifier / a real symbol, as opposed to a clone-based placeholder like `AC0…` or `RP11-` that flags an uncharacterised locus. |
+| **Entrez cross-reference** (`has_entrez`) | The gene maps to a current NCBI (Entrez) gene — a second, independent authority agreeing the locus is real. Used as the coding-support stand-in when working offline. |
+
+```{r biomart}
+bm_cache <- file.path(params$cache_dir, sprintf("annotation_%s.rds", params$ensembl_version))
+
+# --- connect: PINNED archive first (reproducible), else current release via a live mirror ---
+connect_mart <- function(version) {
+  if (is.numeric(version) || grepl("^[0-9]+$", version)) {
+    m <- tryCatch(biomaRt::useEnsembl("genes", "hsapiens_gene_ensembl",
+                                      version = as.integer(version)), error = function(e) NULL)
+    if (!is.null(m)) return(list(mart = m, used = paste0("release ", version, " (pinned archive)")))
+    message("Pinned archive for release ", version, " unreachable; trying current release.")
+  }
+  for (mir in list(NULL, "useast", "asia", "www")) {
+    m <- tryCatch(
+      if (is.null(mir)) biomaRt::useEnsembl("genes", "hsapiens_gene_ensembl")
+      else biomaRt::useEnsembl("genes", "hsapiens_gene_ensembl", mirror = mir),
+      error = function(e) NULL)
+    if (!is.null(m)) return(list(mart = m,
+      used = paste0("current release", if (!is.null(mir)) paste0(" (mirror: ", mir, ")") else ""))
+    )
+  }
+  stop("Could not connect to Ensembl biomaRt on any host.")
+}
+
+# --- resilient fetch: FILTERED, CHUNKED, with per-chunk retries ---
+getBM_chunked <- function(attrs, ids, mart, chunk = 1200, tries = 3) {
+  out <- list()
+  for (i in seq(1, length(ids), by = chunk)) {
+    v <- ids[i:min(i + chunk - 1, length(ids))]; r <- NULL
+    for (t in seq_len(tries)) {
+      r <- tryCatch(biomaRt::getBM(attrs, filters = "ensembl_gene_id", values = v, mart = mart),
+                    error = function(e) NULL)
+      if (!is.null(r)) break
+    }
+    if (is.null(r)) stop("getBM failed for a chunk after ", tries, " tries")
+    out[[length(out) + 1]] <- r
+  }
+  dplyr::bind_rows(out)
+}
+
+fetch_biomart <- function(ids, version) {
+  conn <- connect_mart(version); mart <- conn$mart
+  pick <- function(x) intersect(x, biomaRt::listAttributes(mart)$name)
+  g  <- getBM_chunked(pick(c("ensembl_gene_id","external_gene_name","hgnc_symbol",
+                             "hgnc_id","gene_biotype","entrezgene_id")), ids, mart)
+  tx <- getBM_chunked(pick(c("ensembl_gene_id","ensembl_transcript_id","transcript_tsl",
+                             "transcript_appris","ccds","transcript_gencode_basic")), ids, mart)
+  list(gene = g, tx = tx, mode = "biomaRt", source = conn$used)
+}
+
+# --- offline fallback: NCBI via org.Hs.eg.db (fully local; no Ensembl-only attrs) ---
+fetch_offline <- function(ids) {
+  m <- suppressMessages(AnnotationDbi::select(org.Hs.eg.db::org.Hs.eg.db, keys = unique(ids),
+         keytype = "ENSEMBL", columns = c("SYMBOL","GENETYPE","ENTREZID")))
+  m <- m[!duplicated(m$ENSEMBL), ]
+  map <- c(`protein-coding`="protein_coding", ncRNA="lncRNA", pseudo="pseudogene",
+           snoRNA="snoRNA", snRNA="snRNA", rRNA="rRNA", scRNA="scRNA", tRNA="tRNA")
+  bt <- unname(ifelse(is.na(m$GENETYPE), NA_character_,
+                      ifelse(m$GENETYPE %in% names(map), map[m$GENETYPE], m$GENETYPE)))
+  g <- data.frame(ensembl_gene_id = m$ENSEMBL, external_gene_name = m$SYMBOL,
+                  hgnc_symbol = m$SYMBOL, hgnc_id = NA_character_, gene_biotype = bt,
+                  entrezgene_id = m$ENTREZID, stringsAsFactors = FALSE)
+  tx <- data.frame(ensembl_gene_id = character(0), transcript_tsl = character(0),
+                   transcript_appris = character(0), ccds = character(0),
+                   transcript_gencode_basic = character(0), stringsAsFactors = FALSE)
+  list(gene = g, tx = tx, mode = "org.Hs.eg.db (offline fallback)",
+       source = "NCBI via org.Hs.eg.db; Ensembl-only attributes (CCDS/TSL/APPRIS/GENCODE-basic) unavailable")
+}
+
+if (file.exists(bm_cache)) {
+  cached <- readRDS(bm_cache)
+} else {
+  cached <- tryCatch(fetch_biomart(gene_tbl$gene_id, params$ensembl_version),
+                     error = function(e) {
+                       message("biomaRt unavailable (", conditionMessage(e),
+                               "); using offline org.Hs.eg.db fallback.")
+                       fetch_offline(gene_tbl$gene_id)
+                     })
+  saveRDS(cached, bm_cache)
+}
+bm_gene <- cached$gene; bm_tx <- cached$tx
+anno_mode <- cached$mode; biomart_source <- cached$source
+offline <- anno_mode != "biomaRt"
+cat(sprintf("Annotation source: %s [%s]\n", anno_mode, biomart_source))
+# ensure optional columns exist regardless of source/release
+for (a in c("hgnc_id","entrezgene_id")) if (!a %in% names(bm_gene)) bm_gene[[a]] <- NA
+for (a in c("transcript_tsl","transcript_appris","ccds","transcript_gencode_basic"))
+  if (!a %in% names(bm_tx)) bm_tx[[a]] <- NA_character_
+```
+
+```{r biomart-rollup}
+na_if_blank <- function(x) { x <- as.character(x); x[!nzchar(x)] <- NA; x }
+tsl_int <- function(x) suppressWarnings(as.integer(sub("tsl([0-9]+).*", "\\1", x)))
+
+gene_anno <- bm_gene %>%
+  group_by(ensembl_gene_id) %>%
+  summarise(gene_biotype = dplyr::first(gene_biotype),
+            ens_symbol  = dplyr::first(na_if_blank(external_gene_name)),
+            hgnc_symbol = dplyr::first(na_if_blank(hgnc_symbol)),
+            hgnc_id     = dplyr::first(na_if_blank(hgnc_id)),
+            entrez_id   = dplyr::first(na_if_blank(as.character(entrezgene_id))),
+            .groups = "drop")
+
+tx_anno <- bm_tx %>%
+  mutate(tsl = tsl_int(if ("transcript_tsl" %in% names(.)) transcript_tsl else NA),
+         appris = if ("transcript_appris" %in% names(.)) transcript_appris else NA_character_,
+         ccds_v = if ("ccds" %in% names(.)) ccds else NA_character_,
+         basic  = if ("transcript_gencode_basic" %in% names(.)) transcript_gencode_basic else NA_character_) %>%
+  group_by(ensembl_gene_id) %>%
+  summarise(min_tsl = suppressWarnings(min(tsl, na.rm = TRUE)),
+            # note: nzchar(NA) is TRUE in R, so test !is.na() on the blanked value instead
+            has_ccds = any(!is.na(na_if_blank(ccds_v))),
+            has_appris_principal = any(grepl("principal", appris), na.rm = TRUE),
+            has_gencode_basic = any(!is.na(na_if_blank(basic))),
+            .groups = "drop") %>%
+  mutate(min_tsl = ifelse(is.finite(min_tsl), min_tsl, NA_integer_))
+```
+
+# 4. Annotate: retired, biotype, symbol quality
+
+We join the Ensembl fields onto the gene bodies and derive the flags we filter on. A gene is
+**retired** if its ID is not in the pinned release. We measure that against Ensembl, not NCBI,
+because NCBI does not carry many Ensembl lncRNAs and would make far too many genes look retired.
+**Biotype** and **symbol** come across in the same join. We keep two symbol flags: `has_symbol` is
+true if any name exists, and `approved_symbol` is the stricter one — an HGNC identifier, or at least
+a real name that is not a clone placeholder like `AC0…` or `RP11-`. A gene with only a clone name is
+usually one nobody has characterised. We also record whether the gene maps to a current Entrez gene,
+as a second check that it is real.
+
+The **biotypes of interest** — the ones we keep — are set in `params$keep_biotypes`, currently
+**`r paste(params$keep_biotypes, collapse = ", ")`**. That is protein-coding and lncRNA, with
+`lincRNA` there only as the older Ensembl spelling of `lncRNA`. Everything else (pseudogenes, TEC,
+and the small-RNA classes: miRNA, snRNA, snoRNA, misc_RNA and so on) is dropped at `pass_biotype`,
+which is what `keep` builds on.
+
+```{r annotate}
+gene_tbl <- gene_tbl %>%
+  left_join(gene_anno, by = c("gene_id" = "ensembl_gene_id")) %>%
+  left_join(tx_anno,   by = c("gene_id" = "ensembl_gene_id")) %>%
+  mutate(
+    in_ensembl   = !is.na(gene_biotype),               # present in the annotation source (current)
+    retired      = !in_ensembl,                        # trusted-source retired call
+    symbol       = dplyr::coalesce(ens_symbol, hgnc_symbol),
+    has_symbol   = !is.na(symbol),
+    has_entrez   = !is.na(entrez_id),                  # cross-referenced to a current NCBI gene
+    # HGNC-approved id (online) or, offline, a real symbol that is not a clone/auto name
+    clone_name   = grepl("^(A[CFLP][0-9]|AL[0-9]|BX[0-9]|CR[0-9]|CT[A-D]-|RP[0-9]{1,2}-|LL[0-9]|Z[0-9]{5}|LINC[0-9])",
+                         dplyr::coalesce(symbol, "")),
+    approved_symbol = ifelse(!is.na(hgnc_id), TRUE, has_symbol & !clone_name),
+    pass_biotype = gene_biotype %in% params$keep_biotypes,
+    keep         = in_ensembl & pass_biotype,
+    # NA-safe confidence components
+    has_ccds = T0(has_ccds), has_appris_principal = T0(has_appris_principal),
+    has_gencode_basic = T0(has_gencode_basic),
+    complete_orf = T0(complete_orf), multi_exon = T0(multi_exon)
+  )
+```
+
+# 5. Overlap / nesting (dual reference frame, strand-agnostic)
+
+We count over whole gene bodies and the library may be unstranded, so two loci that overlap on the
+genome, on either strand, give reads we cannot assign to one or the other. For each gene we flag
+whether its body overlaps another and whether it sits entirely inside a larger one. We do this
+twice: against the **full annotation**, which is just a property of the locus, and against the
+**confident (KEEP) set**, which is what matters for counting since reads are only split between genes
+we keep. Use the KEEP-frame numbers when judging the real cost of overlap.
+
+```{r overlaps}
+flag_against <- function(tbl, member_mask) {
+  n <- nrow(tbl); ov <- ne <- logical(n)
+  gr_all <- GRanges(tbl$chr, IRanges(tbl$start, tbl$end))
+  gr_ref <- gr_all[member_mask]; idx_ref <- which(member_mask)
+  o <- findOverlaps(gr_all, gr_ref); o <- o[idx_ref[subjectHits(o)] != queryHits(o)]
+  ov[unique(queryHits(o))] <- TRUE
+  w <- findOverlaps(gr_all, gr_ref, type = "within"); w <- w[idx_ref[subjectHits(w)] != queryHits(w)]
+  ne[unique(queryHits(w))] <- TRUE
+  list(overlaps = ov, nested = ne)
+}
+full  <- flag_against(gene_tbl, rep(TRUE, n0))
+keepf <- flag_against(gene_tbl, gene_tbl$keep)
+gene_tbl$overlaps_full  <- full$overlaps
+gene_tbl$nested_in_full <- full$nested
+gene_tbl$overlaps_keep  <- keepf$overlaps
+gene_tbl$nested_in_keep <- keepf$nested
+```
+
+# 6. Composite confidence tier (biotype-aware)
+
+We roll the evidence into one tier per gene. It is a set of conditions, not a score, and every
+component stays in the table so the reason for a call is visible. The rule branches by biotype,
+because the evidence means different things for different genes: coding genes are judged on CCDS, a
+complete ORF, transcript support level and symbol; lncRNAs, which have no CCDS or ORF, on exon
+structure, TSL, the GENCODE-basic tag and symbol. The thresholds are our defaults and easy to change.
+
+The tier uses **evidence only**. It does not include the gene-nesting filter, so nesting stays a
+separate choice (the `_no_nested` variant below, and Section 12). The rules:
+
+| Tier | A **protein-coding** gene qualifies if… | An **lncRNA** gene qualifies if… |
+|---|---|---|
+| **high** | it has a complete ORF, an approved symbol, and strong support — in CCDS or transcript support level (TSL) ≤ 1 | it is multi-exon, has an approved symbol, and is in the GENCODE basic set or has TSL ≤ 2 |
+| **medium** | it does not meet the high bar, but has a complete ORF plus at least one supporting line of evidence — CCDS, an APPRIS principal isoform, GENCODE basic, or TSL ≤ 3 | it does not meet the high bar, but is in the GENCODE basic set or has TSL ≤ 3 |
+| **low** | it is in `keep` but meets neither bar above (e.g. no complete ORF, or a complete ORF with no support and/or only a clone-based name) | it is in `keep` but meets neither bar above |
+| **excluded** | it is not in `keep` — retired, or a biotype we do not count | same |
+
+(When the report runs offline, where CCDS/TSL/APPRIS are unavailable, a cross-reference to a current
+Entrez gene stands in for the coding-gene support term.)
+
+Nesting is applied on top as an optional filter. `keep_high` is the evidence-based high set and can
+still contain a gene nested inside another kept gene; `keep_high_no_nested` is the same set with
+those removed. Keeping both lets the user decide rather than baking the choice into the tier.
+
+```{r tier}
+gene_tbl <- gene_tbl %>% mutate(
+  confidence_tier = dplyr::case_when(
+    !keep ~ "excluded",
+    # ---- protein-coding ----  (evidence only; nesting handled separately below)
+    #      (offline: Entrez cross-ref substitutes for CCDS/TSL)
+    gene_biotype == "protein_coding" & complete_orf &
+      (has_ccds | T0(min_tsl <= 1) | (offline & has_entrez)) &
+      approved_symbol                                                             ~ "high",
+    gene_biotype == "protein_coding" & complete_orf &
+      (has_ccds | has_appris_principal | has_gencode_basic | T0(min_tsl <= 3) |
+         (offline & has_entrez))                                                  ~ "medium",
+    gene_biotype == "protein_coding"                                              ~ "low",
+    # ---- lncRNA / lincRNA ----
+    multi_exon & (has_gencode_basic | T0(min_tsl <= 2)) & approved_symbol         ~ "high",
+    has_gencode_basic | T0(min_tsl <= 3)                                          ~ "medium",
+    TRUE                                                                          ~ "low"
+  ),
+  confidence_tier = factor(confidence_tier, levels = c("high","medium","low","excluded")),
+  keep_high           = keep & confidence_tier == "high",
+  keep_high_no_nested = keep_high & !nested_in_keep,     # high, with the nesting filter applied
+  keep_high_medium    = keep & confidence_tier %in% c("high","medium")
+)
+```
+
+# 7. Final table
+
+This is the table everything else reads from. One row per gene body, holding the coordinates, the
+biotype and symbol, the confidence components, the overlap and nesting flags, and the keep/tier
+decisions. We write it to `gene_confidence_table.csv` so the filtering can be applied to an existing
+count matrix without re-running any of this.
+
+Every column:
+
+| Column | Meaning |
+|---|---|
+| `gene_id` | Ensembl gene ID (ENSG), the key that matches the count matrix. |
+| `symbol` | Gene symbol where one exists (Ensembl display name, falling back to HGNC). |
+| `has_symbol` | TRUE if any symbol is present. |
+| `approved_symbol` | TRUE if the symbol is HGNC-approved / not a clone-based placeholder. |
+| `has_entrez` | TRUE if the gene cross-references to a current NCBI (Entrez) gene. |
+| `chr`, `start`, `end`, `strand` | Gene-body coordinates — the interval counted over. |
+| `width` | Gene-body length in bp (`end - start + 1`). |
+| `gene_biotype` | Ensembl biotype (protein_coding, lncRNA, pseudogene, …). |
+| `in_ensembl` | TRUE if the gene is present in the pinned Ensembl release. |
+| `retired` | TRUE if absent from that release (the opposite of `in_ensembl`). |
+| `pass_biotype` | TRUE if the biotype is one we keep (`params$keep_biotypes`). |
+| `is_coding` | TRUE if any CDS is annotated for the gene. |
+| `complete_orf` | TRUE if a transcript has both a start and a stop codon (complete CDS). |
+| `multi_exon` | TRUE if any transcript has >1 exon (FALSE = single-exon-only locus). |
+| `n_tx` | Number of annotated transcripts (isoforms). |
+| `max_exons` | Largest exon count across the gene's transcripts. |
+| `has_ccds` | TRUE if a transcript is in the Consensus CDS set. |
+| `min_tsl` | Best (lowest) transcript support level over the gene, 1–5; NA if none. |
+| `has_appris_principal` | TRUE if the gene has an APPRIS principal isoform. |
+| `has_gencode_basic` | TRUE if a transcript is in the GENCODE basic set. |
+| `overlaps_full` / `nested_in_full` | Overlaps / is nested inside another gene body — vs the full annotation. |
+| `overlaps_keep` / `nested_in_keep` | The same, but computed only among the confident (KEEP) genes — the decision-relevant figure. |
+| `keep` | TRUE if current and of a wanted biotype (the baseline confident set). |
+| `confidence_tier` | `high` / `medium` / `low` / `excluded` — the composite, evidence-only call (nesting not applied). |
+| `keep_high` | TRUE if `keep` and tier is `high` (may include genes nested in another kept gene). |
+| `keep_high_no_nested` | TRUE if `keep_high` and the gene is not nested inside another kept gene (the stricter, structural variant). |
+| `keep_high_medium` | TRUE if `keep` and tier is `high` or `medium`. |
+
+```{r final-table}
+gene_tbl <- gene_tbl %>%
+  select(gene_id, symbol, has_symbol, approved_symbol, has_entrez,
+         chr, start, end, strand, width,
+         gene_biotype, in_ensembl, retired, pass_biotype,
+         is_coding, complete_orf, multi_exon, n_tx, max_exons,
+         has_ccds, min_tsl, has_appris_principal, has_gencode_basic,
+         overlaps_full, nested_in_full, overlaps_keep, nested_in_keep,
+         keep, confidence_tier, keep_high, keep_high_no_nested, keep_high_medium)
+write.csv(gene_tbl, "gene_confidence_table.csv", row.names = FALSE)
+head(gene_tbl, 20)
+```
+
+# 8. Summary of filters
+
+How many gene bodies pass each filter on its own, and how the confident sets come out. This is the
+quickest way to see where the genes go: how many are retired, how many carry the biotypes we want,
+how many end up high-confidence.
+
+```{r summary-counts}
+pct <- function(x) sprintf("%d (%.1f%%)", sum(x), 100*mean(x))
+kable(tibble::tibble(
+  Filter = c("Total gene bodies",
+             "Current (in Ensembl release)", "Retired (absent)",
+             "Wanted biotype", "Has any symbol", "HGNC-approved symbol",
+             "Complete ORF (start+stop codon)", "Single-exon-only",
+             "Has CCDS", "TSL <= 1 (best-supported)",
+             "Overlaps another (full annotation)", "Nested in another (full annotation)",
+             "KEEP", "KEEP & high confidence", "KEEP & high/medium"),
+  Count = c(sprintf("%d", n0),
+            pct(gene_tbl$in_ensembl), pct(gene_tbl$retired),
+            pct(gene_tbl$pass_biotype), pct(gene_tbl$has_symbol), pct(gene_tbl$approved_symbol),
+            pct(gene_tbl$complete_orf), pct(!gene_tbl$multi_exon),
+            pct(gene_tbl$has_ccds), pct(T0(gene_tbl$min_tsl <= 1)),
+            pct(gene_tbl$overlaps_full), pct(gene_tbl$nested_in_full),
+            pct(gene_tbl$keep), pct(gene_tbl$keep_high), pct(gene_tbl$keep_high_medium))),
+  caption = "Per-filter counts (% of all gene bodies)")
+```
+
+```{r biotype-and-tier}
+gene_tbl %>% mutate(gene_biotype = ifelse(retired, "<retired/absent>", gene_biotype)) %>%
+  count(gene_biotype, sort = TRUE) %>% mutate(pct = sprintf("%.1f%%", 100*n/n0)) %>%
+  kable(caption = "Biotype composition (pinned Ensembl release)")
+
+gene_tbl %>% count(confidence_tier) %>% mutate(pct = sprintf("%.1f%%", 100*n/n0)) %>%
+  kable(caption = "Confidence-tier distribution")
+```
+
+# 9. Relationship between the confidence signals
+
+These signals are meant to be independent lines of evidence, so we check that they agree. The
+cross-tabs below, all within the KEEP set, look at whether complete ORF and CCDS pick out the same
+coding genes, whether the tier tracks symbol quality, whether nesting sits in the lower tiers, and
+how the overlap burden drops as we tighten from KEEP to high/medium to high. If tightening confidence
+also cuts overlap, the two concerns point the same way and a stricter set also counts more cleanly.
+
+```{r agreement}
+keepd <- filter(gene_tbl, keep)
+
+# coding genes: do complete-ORF and CCDS agree?
+keepd %>% filter(gene_biotype == "protein_coding") %>%
+  count(complete_orf, has_ccds) %>%
+  kable(caption = "protein_coding: complete_orf x has_ccds")
+
+# tier vs symbol quality
+kable(addmargins(table(tier = keepd$confidence_tier, approved_symbol = keepd$approved_symbol)),
+      caption = "confidence_tier x HGNC-approved symbol (KEEP set)")
+
+# tier vs nesting within KEEP
+kable(addmargins(table(tier = keepd$confidence_tier, nested_in_keep = keepd$nested_in_keep)),
+      caption = "confidence_tier x nested within KEEP")
+
+# overlap burden by tier-based set
+kable(tibble::tibble(
+  Set = c("KEEP", "KEEP high/medium", "KEEP high"),
+  n   = c(sum(gene_tbl$keep), sum(gene_tbl$keep_high_medium), sum(gene_tbl$keep_high)),
+  overlapping_within_set = c(
+    sprintf("%.1f%%", 100*mean(gene_tbl$overlaps_keep[gene_tbl$keep])),
+    sprintf("%.1f%%", 100*mean(flag_against(gene_tbl, gene_tbl$keep_high_medium)$overlaps[gene_tbl$keep_high_medium])),
+    sprintf("%.1f%%", 100*mean(flag_against(gene_tbl, gene_tbl$keep_high)$overlaps[gene_tbl$keep_high])))),
+  caption = "Overlap burden shrinks with stricter confidence")
+```
+
+```{r upset, eval = requireNamespace("UpSetR", quietly = TRUE)}
+UpSetR::upset(UpSetR::fromList(list(
+  current        = gene_tbl$gene_id[gene_tbl$in_ensembl],
+  wanted_biotype = gene_tbl$gene_id[gene_tbl$pass_biotype],
+  complete_orf   = gene_tbl$gene_id[gene_tbl$complete_orf],
+  has_ccds       = gene_tbl$gene_id[gene_tbl$has_ccds],
+  approved_symbol = gene_tbl$gene_id[gene_tbl$approved_symbol],
+  non_nested     = gene_tbl$gene_id[!gene_tbl$nested_in_full])),
+  nsets = 6, order.by = "freq")
+```
+
+# 10. Using the table to build the counting annotation
+
+To put the filtered set back into the pipeline we subset the table to the tier we want and hand those
+intervals to `featureCounts` as before. The example uses the high/medium set; swap in `keep`,
+`keep_high`, or `keep_high_no_nested` depending on how strict we want to be. The one change from the
+production call is `allowMultiOverlap = FALSE`, which drops reads in the leftover overlaps instead of
+double-counting them, now that most of the overlapping loci are already gone.
+
+```{r saf-example, eval = FALSE}
+conf <- subset(gene_tbl, keep_high_medium)          # or keep / keep_high / keep_high_no_nested
+saf  <- data.frame(GeneID = conf$gene_id, Chr = conf$chr,
+                   Start = conf$start, End = conf$end, Strand = conf$strand)
+Rsubread::featureCounts(files = <bam>, annot.ext = saf, isGTFAnnotationFile = FALSE,
+                        useMetaFeatures = TRUE, strandSpecific = 0, isPairedEnd = TRUE,
+                        allowMultiOverlap = FALSE)   # discard ambiguous reads in residual overlaps
+```
+
+# 11. Composition of the confident sets
+
+Before the recommendations, here is what each set actually contains. The first table breaks the sets
+down by biotype; the second puts the summary metrics side by side, with the overlap and nesting
+burden recomputed within each set (the figure that matters for counting). Tightening from `KEEP` to
+`KEEP high` shifts the mix toward protein-coding, well-supported genes and pulls the overlap down.
+`KEEP high (no nested)` is `KEEP high` with the gene-nesting filter applied.
+
+```{r composition}
+sets <- list(
+  `KEEP`                 = gene_tbl$keep,
+  `KEEP high`            = gene_tbl$keep_high,
+  `KEEP high (no nested)`= gene_tbl$keep_high_no_nested,
+  `KEEP high+medium`     = gene_tbl$keep_high_medium
+)
+
+# --- biotype composition across the sets ---
+bt <- lapply(names(sets), function(s) count(gene_tbl[sets[[s]], ], gene_biotype, name = s))
+biotype_tab <- Reduce(function(a, b) full_join(a, b, by = "gene_biotype"), bt) %>%
+  mutate(across(-gene_biotype, ~ tidyr::replace_na(.x, 0L))) %>%
+  arrange(desc(.data[["KEEP"]]))
+kable(biotype_tab, caption = "Biotype composition of each confident set (gene counts)")
+
+# --- summary metrics across the sets ---
+metric_col <- function(mask) {
+  d <- gene_tbl[mask, ]; f <- flag_against(gene_tbl, mask)
+  c(`n genes`         = format(nrow(d), big.mark = ","),
+    `protein_coding`  = sprintf("%.1f%%", 100 * mean(d$gene_biotype == "protein_coding")),
+    `lncRNA`          = sprintf("%.1f%%", 100 * mean(d$gene_biotype %in% c("lncRNA","lincRNA"))),
+    `has CCDS`        = sprintf("%.1f%%", 100 * mean(d$has_ccds)),
+    `complete ORF`    = sprintf("%.1f%%", 100 * mean(d$complete_orf)),
+    `multi-exon`      = sprintf("%.1f%%", 100 * mean(d$multi_exon)),
+    `approved symbol` = sprintf("%.1f%%", 100 * mean(d$approved_symbol)),
+    `TSL <= 1`        = sprintf("%.1f%%", 100 * mean((d$min_tsl <= 1) %in% TRUE)),
+    `median width bp` = format(round(median(d$width)), big.mark = ","),
+    `overlaps (within set)` = sprintf("%.1f%%", 100 * mean(f$overlaps[mask])),
+    `nested (within set)`   = sprintf("%.1f%%", 100 * mean(f$nested[mask])))
+}
+metrics_tab <- sapply(sets, metric_col)
+kable(metrics_tab, caption = "Summary metrics for each confident set")
+```
+
+Since nesting is optional, the table below shows how many genes in each set sit nested inside another
+kept gene, i.e. how many the `_no_nested` variant removes. Nesting is measured against the KEEP set,
+so `KEEP high (no nested)` is 0% by construction.
+
+```{r nesting}
+nest_row <- function(mask) {
+  d <- gene_tbl[mask, ]
+  c(`n genes`               = format(sum(mask), big.mark = ","),
+    `nested in a kept gene` = sprintf("%d (%.1f%%)", sum(d$nested_in_keep),
+                                      100 * mean(d$nested_in_keep)))
+}
+nest_tab <- sapply(list(
+  `KEEP`                  = gene_tbl$keep,
+  `KEEP high`             = gene_tbl$keep_high,
+  `KEEP high (no nested)` = gene_tbl$keep_high_no_nested,
+  `KEEP high+medium`      = gene_tbl$keep_high_medium), nest_row)
+kable(nest_tab, caption = "Gene-nesting within each set (nesting measured against the KEEP set)")
+cat(sprintf("Applying the no-nested filter to KEEP high removes %d of %d genes (%.1f%%).\n",
+            sum(gene_tbl$keep_high & gene_tbl$nested_in_keep), sum(gene_tbl$keep_high),
+            100 * mean(gene_tbl$nested_in_keep[gene_tbl$keep_high])))
+```
+
+# 12. Recommendations for filtering
+
+This is how we would use the table. There are four filter columns of increasing strictness, each a
+subset of the one above, so the choice is really how strict to be. (They are set-membership filters;
+only the last, `keep_high_no_nested`, uses the `nested_in_keep` gene-nesting flag.)
+
+| Column | What it selects | Rough size | Use it when |
+|---|---|---|---|
+| **`keep`** | Current genes (not retired) of a wanted biotype — protein-coding and lncRNA. No confidence requirement beyond that. | largest (~33k) | The permissive floor: everything real and on-target, nothing more thrown away. The minimum any analysis should apply. |
+| **`keep_high_medium`** | `keep`, restricted to genes tiered `high` or `medium` — i.e. some positive support evidence (CCDS / complete ORF / TSL / basic / a real symbol), but not the full high bar. | middle (~32k) | A little more coverage is worth a little less stringency. |
+| **`keep_high`** | `keep`, restricted to the `high` tier — current, protein-coding, complete ORF, a real (HGNC- or Entrez-backed) symbol, and CCDS or strong transcript support. Evidence only; may still include a gene nested inside another kept gene. | small (~21k) | The recommended default for a protein-coding differential-expression analysis. |
+| **`keep_high_no_nested`** | `keep_high` with the gene-nesting filter applied — the high-confidence genes that are also not nested inside another kept gene. | smallest, cleanest | You want to eliminate the residual ambiguity from nested loci as well, and can accept dropping the (few) legitimate nested genes. |
+
+The sets nest: `keep_high_no_nested` ⊆ `keep_high` ⊆ `keep_high_medium` ⊆ `keep`. Going stricter
+mainly trades lncRNAs and weakly-supported loci for a cleaner, more coding-focused set with much less
+overlap (Section 11). `keep` is the floor and drops only retired IDs and off-target biotypes;
+`keep_high` is what we would trust for the primary analysis; `keep_high_medium` sits between the two
+when coverage matters more than stringency; `keep_high_no_nested` is `keep_high` with the nested loci
+gone. We keep nesting as its own step rather than folding it into the tier so it stays the user's
+call, since the genes it removes include real nested and bidirectional pairs.
+
+lncRNAs need more caution than coding genes and are a separate decision. Their evidence is thinner
+(no CCDS, no ORF), the annotation changes faster, and they drive most of the overlap. If the biology
+needs lncRNAs, include them but lean on the tier: prefer their `high` calls and look at them case by
+case rather than trusting the whole set.
+
+So: `keep` is the floor, `keep_high` is the default for a coding analysis, `keep_high_medium` trades
+stringency for coverage, `keep_high_no_nested` adds the nesting filter on top of `keep_high`, and
+lncRNAs are handled deliberately.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

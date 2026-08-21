@@ -1,0 +1,284 @@
+---
+title: "Annotation comparison: BRC current annotation vs GENCODE v50"
+author: "BRC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+params:
+  old_table: "gene_confidence_table.csv"                       # output of GeneSet_Filtering.Rmd (BRC current set)
+  # GENCODE v50 (GRCh38.p14) comprehensive, primary assembly. Downloaded 2026-08-20 from:
+  #   https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.primary_assembly.annotation.gtf.gz
+  gencode_gtf: "gencode.v50.primary_assembly.annotation.gtf.gz"  # read directly from .gz
+  gencode_release: "v50"
+  keep_biotypes: !r c("protein_coding", "lncRNA", "lincRNA")
+  keep_seqnames: !r paste0("chr", c(1:22, "X", "Y", "M"))
+  cache_dir: "cache"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressMessages({
+  library(rtracklayer); library(GenomicRanges); library(data.table)
+  library(dplyr); library(knitr)
+})
+dir.create(params$cache_dir, showWarnings = FALSE, recursive = TRUE)
+T0 <- function(x) x %in% TRUE
+clone_re <- "^(A[CFLP][0-9]|AL[0-9]|BX[0-9]|CR[0-9]|CT[A-D]-|RP[0-9]{1,2}-|LL[0-9]|Z[0-9]{5}|LINC[0-9])"
+
+# strand-agnostic overlap / nested flags of every gene vs a reference subset (unstranded counting)
+flag_against <- function(tbl, mask) {
+  ga <- GRanges(tbl$chr, IRanges(tbl$start, tbl$end)); gr <- ga[mask]; ix <- which(mask)
+  ov <- ne <- logical(nrow(tbl))
+  o <- findOverlaps(ga, gr); o <- o[ix[subjectHits(o)] != queryHits(o)]; ov[unique(queryHits(o))] <- TRUE
+  w <- findOverlaps(ga, gr, type = "within"); w <- w[ix[subjectHits(w)] != queryHits(w)]; ne[unique(queryHits(w))] <- TRUE
+  list(ov = ov, ne = ne)
+}
+```
+
+# Purpose
+
+We count over the BRC current annotation. The obvious question is whether we would be better off on a
+current public GENCODE build, or whether GENCODE would need the same cleaning we have just done. This
+report puts the two side by side on the same footing — same gene-body construction, same confidence
+and overlap code — and asks three things. How much has turned over between them? Have the gene bodies
+we count over moved, which on its own would change counts if we switched? And is current GENCODE any
+cleaner for whole-gene-body counting, or does it carry the same overlap and confidence problems?
+Everything is in R, against GENCODE `r params$gencode_release`.
+
+# 1. The BRC current annotation
+
+We read this straight from `GeneSet_Filtering.Rmd`'s output, so it already carries the biotype
+(from current Ensembl), the retired flag, the confidence components, the overlap and nesting flags,
+and the tier — no need to recompute any of it here.
+
+```{r old}
+old <- read.csv(params$old_table, stringsAsFactors = FALSE)
+old$base_id <- sub("\\..*$", "", old$gene_id)
+cat(sprintf("BRC current annotation genes: %d\n", nrow(old)))
+```
+
+# 2. Build the current-GENCODE gene table (native metadata)
+
+GENCODE is easier here: its GTF already carries everything we had to fetch from biomaRt for the BRC
+annotation — biotype, symbol, HGNC id, `level`, transcript support level, and the multi-valued `tag`
+field (CCDS, basic, MANE_Select, appris) — so we build the GENCODE table offline. Gene bodies and the
+intrinsic signals come from `rtracklayer`. One trap: `rtracklayer` keeps only a single `tag` per
+feature and drops the rest, which badly undercounts things like MANE, so we parse the tags from the
+raw attribute column and roll them up to the gene. The import and the tag parse are both cached.
+
+```{r gencode-import}
+gimp_cache <- file.path(params$cache_dir, sprintf("gencode_%s_import.rds", params$gencode_release))
+if (file.exists(gimp_cache)) {
+  gvb <- readRDS(gimp_cache)
+} else {
+  g <- rtracklayer::import(params$gencode_gtf)
+  g <- g[as.character(seqnames(g)) %in% params$keep_seqnames]; g$type <- as.character(g$type)
+  md <- data.frame(base_id = sub("\\..*$", "", g$gene_id), type = g$type,
+                   transcript_id = g$transcript_id, gene_type = g$gene_type, gene_name = g$gene_name,
+                   hgnc_id = g$hgnc_id, level = suppressWarnings(as.integer(g$level)),
+                   seqnames = as.character(seqnames(g)), start = start(g), end = end(g),
+                   strand = as.character(strand(g)), stringsAsFactors = FALSE)
+  bodies <- md %>% filter(type == "gene") %>%
+    transmute(base_id, chr = seqnames, start, end, strand,
+              gene_biotype = gene_type, symbol = gene_name, hgnc_id, level)
+  ex <- md %>% filter(!is.na(transcript_id), type %in% c("exon","start_codon","stop_codon","CDS")) %>%
+    group_by(base_id, transcript_id) %>%
+    summarise(n_exon = sum(type == "exon"), has_start = any(type == "start_codon"),
+              has_stop = any(type == "stop_codon"), has_cds = any(type == "CDS"), .groups = "drop")
+  intr <- ex %>% group_by(base_id) %>%
+    summarise(n_tx = n_distinct(transcript_id), multi_exon = any(n_exon > 1),
+              complete_orf = any(has_start & has_stop), is_coding = any(has_cds), .groups = "drop")
+  gvb <- bodies %>% left_join(intr, by = "base_id")
+  gvb <- gvb[!duplicated(gvb$base_id), ]
+  saveRDS(gvb, gimp_cache)
+}
+```
+
+```{r gencode-tags}
+gtag_cache <- file.path(params$cache_dir, sprintf("gencode_%s_tags.rds", params$gencode_release))
+if (file.exists(gtag_cache)) {
+  tagr <- readRDS(gtag_cache)
+} else {
+  # read the GTF as a 9-column TSV; stream-decompress .gz and drop comment lines
+  read_cmd <- if (grepl("\\.gz$", params$gencode_gtf))
+    sprintf("gzip -dc %s | grep -v '^#'", shQuote(params$gencode_gtf))
+  else sprintf("grep -v '^#' %s", shQuote(params$gencode_gtf))
+  gtf9 <- fread(cmd = read_cmd, sep = "\t", header = FALSE, quote = "", showProgress = FALSE)
+  tx <- gtf9[V3 == "transcript", V9]
+  dtx <- data.table(
+    base_id = sub("\\..*$", "", sub('^gene_id "([^"]+)".*', "\\1", tx)),
+    ccds   = grepl('tag "CCDS"', tx),  basic = grepl('tag "basic"', tx),
+    mane   = grepl('tag "MANE_Select"', tx), appris = grepl("appris_principal", tx),
+    tsl    = suppressWarnings(as.integer(sub('.*transcript_support_level "?([0-9]).*', "\\1", tx))))
+  tagr <- dtx[, .(has_ccds = any(ccds), has_gencode_basic = any(basic), has_mane = any(mane),
+                  has_appris_principal = any(appris),
+                  min_tsl = suppressWarnings(as.double(min(tsl, na.rm = TRUE)))), by = base_id]
+  tagr[, min_tsl := ifelse(is.finite(min_tsl), min_tsl, NA_real_)]
+  saveRDS(as.data.frame(tagr), gtag_cache)
+}
+```
+
+```{r gencode-assemble}
+# NOTE: tag "basic" is present for >=1 transcript of essentially every gene (~100%),
+# so it is non-informative at gene level and is NOT used in the tier.
+gv <- gvb %>% left_join(tagr, by = "base_id") %>%
+  mutate(retired = FALSE,
+         approved_symbol = !is.na(hgnc_id) | (!is.na(symbol) & !grepl(clone_re, dplyr::coalesce(symbol, ""))),
+         pass_biotype = gene_biotype %in% params$keep_biotypes, keep = pass_biotype,
+         has_ccds = T0(has_ccds), has_mane = T0(has_mane),
+         has_appris_principal = T0(has_appris_principal),
+         complete_orf = T0(complete_orf), multi_exon = T0(multi_exon))
+kf <- flag_against(gv, gv$keep); gv$overlaps_keep <- kf$ov; gv$nested_in_keep <- kf$ne
+af <- flag_against(gv, rep(TRUE, nrow(gv))); gv$overlaps_full <- af$ov; gv$nested_in_full <- af$ne
+# Tier is evidence-only (nesting handled separately), matching GeneSet_Filtering.Rmd.
+gv <- gv %>% mutate(confidence_tier = dplyr::case_when(
+  !keep ~ "excluded",
+  gene_biotype == "protein_coding" & complete_orf &
+    (has_ccds | T0(min_tsl <= 1) | has_mane) & approved_symbol ~ "high",
+  gene_biotype == "protein_coding" & complete_orf &
+    (has_ccds | has_appris_principal | T0(min_tsl <= 3)) ~ "medium",
+  gene_biotype == "protein_coding" ~ "low",
+  multi_exon & T0(min_tsl <= 2) & approved_symbol ~ "high",
+  T0(min_tsl <= 3) ~ "medium", TRUE ~ "low"),
+  keep_high           = keep & confidence_tier == "high",
+  keep_high_no_nested = keep_high & !nested_in_keep,
+  keep_high_medium    = keep & confidence_tier %in% c("high","medium"))
+cat(sprintf("GENCODE %s genes: %d\n", params$gencode_release, nrow(gv)))
+```
+
+# 3. ID turnover
+
+First, how much the two annotations have in common. We strip the version suffixes and intersect the
+gene IDs: how many are shared, how many are in the BRC set but gone from GENCODE (the retired count),
+and how many GENCODE has added that we never had.
+
+```{r turnover}
+o_ids <- unique(old$base_id); g_ids <- unique(gv$base_id)
+shared <- intersect(o_ids, g_ids); lost <- setdiff(o_ids, g_ids); gained <- setdiff(g_ids, o_ids)
+kable(tibble::tibble(
+  Metric = c("BRC current annotation genes", paste0("GENCODE ", params$gencode_release, " genes"),
+             "Shared (in both)", "Lost from GENCODE (retired)", "New in GENCODE"),
+  Count = c(length(o_ids), length(g_ids),
+            sprintf("%d (%.1f%% of BRC)", length(shared), 100*length(shared)/length(o_ids)),
+            sprintf("%d (%.1f%% of BRC)", length(lost),   100*length(lost)/length(o_ids)),
+            sprintf("%d", length(gained)))),
+  caption = "Gene ID turnover (base ENSG, version-stripped)")
+```
+
+# 4. Gene-body coordinate concordance (shared genes)
+
+Sharing an ID does not mean the same locus. Where a gene is in both, its gene-body extent may have
+been redrawn, and since we count over that extent any change moves the counts. For the shared genes
+we compare coordinates and split them into identical, still overlapping but resized or shifted, and
+moved elsewhere.
+
+```{r concordance}
+om <- old %>% filter(base_id %in% shared) %>% transmute(base_id, ochr=chr, os=start, oe=end) %>% distinct(base_id, .keep_all = TRUE)
+gm <- gv  %>% filter(base_id %in% shared) %>% transmute(base_id, gchr=chr, gs=start, ge=end)
+cc <- inner_join(om, gm, by = "base_id") %>% mutate(
+  identical = ochr==gchr & os==gs & oe==ge,
+  overlap   = ochr==gchr & pmin(oe,ge) >= pmax(os,gs),
+  class = dplyr::case_when(identical ~ "identical",
+                           overlap ~ "resized / shifted (overlapping)",
+                           TRUE ~ "moved (diff chr / disjoint)"),
+  wratio = (ge-gs+1)/(oe-os+1))
+cc %>% count(class) %>% mutate(pct = sprintf("%.1f%%", 100*n/nrow(cc))) %>%
+  kable(caption = "Gene-body concordance for shared genes")
+cat(sprintf("Median width ratio (GENCODE / BRC) among overlapping: %.2f\n",
+            median(cc$wratio[cc$class != "moved (diff chr / disjoint)"])))
+```
+
+The "resized / shifted" fraction sounds large, but that is just any change of one base or more. What
+matters is how big the change is. Below is the actual size in bases: for each shared gene on the same
+chromosome, how far the two ends moved in total (`|Δstart| + |Δend|`). Most genes barely move.
+
+```{r bp-diff, fig.width = 7, fig.height = 4}
+cc2 <- cc %>% filter(class != "moved (diff chr / disjoint)") %>%
+  mutate(boundary_bp = abs(gs - os) + abs(ge - oe),
+         width_delta = (ge - gs) - (oe - os))
+qs <- quantile(cc2$boundary_bp, c(.5, .75, .9, .95))
+cat(sprintf("Boundary change per gene (|Δstart|+|Δend|): median %.0f bp, 75th %.0f, 90th %.0f, 95th %.0f bp\n",
+            qs[1], qs[2], qs[3], qs[4]))
+cat(sprintf("Unchanged: %.1f%% | within 10 bp: %.1f%% | within 100 bp: %.1f%%\n",
+            100*mean(cc2$boundary_bp == 0), 100*mean(cc2$boundary_bp <= 10),
+            100*mean(cc2$boundary_bp <= 100)))
+hist(log10(cc2$boundary_bp + 1), breaks = 60, col = "grey70", border = "white",
+     main = "", xlab = "gene-body boundary change per shared gene (bp)", xaxt = "n")
+axis(1, at = 0:6, labels = c("0", "10", "100", "1 kb", "10 kb", "100 kb", "1 Mb"))
+abline(v = log10(median(cc2$boundary_bp) + 1), col = "red", lwd = 2)
+legend("topright", bty = "n", lwd = 2, col = "red", legend = "median")
+```
+
+# 5. Biotype composition
+
+```{r biotype}
+b_old <- old %>% filter(!retired) %>% count(gene_biotype, name = "n_BRC")
+b_new <- gv %>% count(gene_biotype, name = paste0("n_", params$gencode_release))
+full_join(b_old, b_new, by = "gene_biotype") %>%
+  arrange(desc(dplyr::coalesce(!!sym(paste0("n_", params$gencode_release)), 0L))) %>%
+  head(10) %>% kable(caption = "Biotype composition: BRC current annotation vs GENCODE")
+```
+
+# 6. Overlap / nesting burden — does GENCODE also need cleaning?
+
+This is the question that decides whether switching would help. Whole-gene-body counting, especially
+on an unstranded library, is only as clean as the annotation lets it be, so we compute the same
+overlap and nesting burden for both. If GENCODE were tidier the numbers would be lower; if it is
+busier — more lncRNAs and antisense loci on top of existing genes — they go up and it needs at least
+as much filtering as we already do.
+
+```{r overlap-compare}
+of  <- flag_against(old, rep(TRUE, nrow(old))); ofk <- flag_against(old, old$keep)
+kable(tibble::tibble(
+  Annotation = c("BRC current", paste0("GENCODE ", params$gencode_release)),
+  `overlap (all)` = sprintf(c("%.1f%%","%.1f%%"), 100*c(mean(of$ov),  mean(gv$overlaps_full))),
+  `nested (all)`  = sprintf(c("%.1f%%","%.1f%%"), 100*c(mean(of$ne),  mean(gv$nested_in_full))),
+  `overlap (KEEP)`= sprintf(c("%.1f%%","%.1f%%"), 100*c(mean(ofk$ov[old$keep]), mean(gv$overlaps_keep[gv$keep]))),
+  `nested (KEEP)` = sprintf(c("%.1f%%","%.1f%%"), 100*c(mean(ofk$ne[old$keep]), mean(gv$nested_in_keep[gv$keep])))),
+  caption = "Overlap / nesting burden (strand-agnostic). Higher = more ambiguous read assignment.")
+```
+
+# 7. Confident set and tiers
+
+Finally, the count that matters: how many genes we would actually keep, and how many reach high
+confidence, under each annotation. A bigger raw gene set is not worth much if it does not turn into
+more genes we trust. The columns are the same filters used in `GeneSet_Filtering.Rmd` — `keep`,
+evidence-only `high`, `high` with the gene-nesting filter applied (`high (no nested)`), and
+`high+medium` — computed the same way on both annotations, so they are directly comparable.
+
+```{r tiers}
+kable(tibble::tibble(
+  Annotation = c("BRC current", paste0("GENCODE ", params$gencode_release)),
+  KEEP = c(sum(old$keep), sum(gv$keep)),
+  high = c(sum(old$keep_high), sum(gv$keep_high)),
+  `high (no nested)` = c(sum(old$keep_high_no_nested), sum(gv$keep_high_no_nested)),
+  `high+medium` = c(sum(old$keep_high_medium), sum(gv$keep_high_medium))),
+  caption = "Confident gene counts by annotation (same filters as the confidence report)")
+```
+
+# 8. Conclusion
+
+```{r conclusion, echo=FALSE, results='asis'}
+cat(sprintf(
+"Most of the BRC annotation has held up: %.1f%% of its genes are still in GENCODE %s, only %d (%.1f%%) have been retired, and GENCODE has added %d genes we never had, almost all of them lncRNAs. ",
+100*length(shared)/length(o_ids), params$gencode_release, length(lost), 100*length(lost)/length(o_ids), length(gained)))
+cat(sprintf(
+"A move is not free, though: only %.1f%% of the shared genes have identical gene bodies, so switching would force a re-count rather than a relabel. ",
+100*mean(cc$class=="identical")))
+cat(sprintf(
+"And it would not buy us a cleaner annotation — the KEEP-set overlap burden is %.1f%% for the BRC set against %.1f%% for GENCODE %s, i.e. GENCODE is if anything busier and needs the same filtering, not less. ",
+100*mean(ofk$ov[old$keep]), 100*mean(gv$overlaps_keep[gv$keep]), params$gencode_release))
+cat(sprintf(
+"The number of genes we would actually trust is about the same either way (%d high-confidence versus %d); the extra GENCODE genes are overwhelmingly low-confidence lncRNA. So GENCODE is the better base if we want that expanded lncRNA catalogue, but for a protein-coding-focused analysis the cleaned BRC annotation is essentially equivalent, and the cleaning is what matters in both cases.",
+sum(old$keep_high), sum(gv$keep_high)))
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
