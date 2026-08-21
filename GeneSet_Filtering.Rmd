@@ -2,6 +2,7 @@
 title: "Confident gene-set construction for nuclear RNA-seq counting"
 author: "BRC"
 date: "`r Sys.Date()`"
+knit: (function(inputFile, encoding) rmarkdown::render(inputFile, encoding = encoding, output_dir = "reports"))
 output:
   html_document:
     toc: true

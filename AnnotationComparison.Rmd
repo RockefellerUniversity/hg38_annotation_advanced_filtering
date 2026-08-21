@@ -2,6 +2,7 @@
 title: "Annotation comparison: BRC current annotation vs GENCODE v50"
 author: "BRC"
 date: "`r Sys.Date()`"
+knit: (function(inputFile, encoding) rmarkdown::render(inputFile, encoding = encoding, output_dir = "reports"))
 output:
   html_document:
     toc: true
